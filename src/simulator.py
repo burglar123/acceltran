@@ -19,6 +19,7 @@ from buffer import *
 from tiled_ops import *
 from accelerator import *
 from dict2ops import main as dict2ops
+from scheduler import Scheduler
 
 
 DO_LOGGING = True
@@ -340,7 +341,7 @@ def simulate(model_dict: dict, config: dict, constants: dict, design_space: dict
 
 	#索引初始化，每个head单独推进
 	assert type(memory_ops[1]) == list and type(compute_ops[0]) == list
-	memory_op_idx, compute_op_idx, ops_done = [0, []], [0, [0] * len(compute_ops[0])], 0
+	memory_op_idx, ops_done = [0, []], 0
 
 	# Get operation batch sizes
 	compute_ops_batch_size = config['scheduler']['compute_ops']['batch_size']
@@ -349,7 +350,8 @@ def simulate(model_dict: dict, config: dict, constants: dict, design_space: dict
 
 	#获取ops
 	# Get operations
-	memory_op, compute_op = get_op_list(memory_ops, memory_op_idx, memory_ops_batch_size), get_op_list(compute_ops, compute_op_idx, compute_ops_batch_size)
+	memory_op = get_op_list(memory_ops, memory_op_idx, memory_ops_batch_size)
+	scheduler = Scheduler(compute_ops)
 
 	# Create logs dictionary
 	logs = {'area': accelerator.area / 1e6}
@@ -372,7 +374,7 @@ def simulate(model_dict: dict, config: dict, constants: dict, design_space: dict
 	#记录日志
 	#更新memory/compute op索引，获取下一批的op
 	# Run operations on the accelerator in a cycle-accurate manner
-	while not compute_ops[-1].done:
+	while not scheduler.all_done():
 		# Update progress bar
 		if not debug:
 			pbar.set_description(f'Simulating accelerator at cycle: {accelerator.cycle}')
@@ -385,7 +387,7 @@ def simulate(model_dict: dict, config: dict, constants: dict, design_space: dict
 		new_stalls = [0] * 7
 
 		if debug: 
-			tqdm.write(f'{color.HEADER}Running memory operation(s) with name(s):\n\t{f"{sp_char}".join([f"- {op.op_name}" for op in memory_op if op])}\nand compute operation(s) with name(s):\n\t{f"{sp_char}".join(["- " + (f"{op.op_name}" if compute_ops_batch_size == 1 else f"{op[0].op_name} + " + str( compute_ops_batch_size - 1) + " more") for op in compute_op if op])}{color.ENDC}')
+			tqdm.write(f'{color.HEADER}Running memory operation(s) with name(s):\n\t{f"{sp_char}".join([f"- {op.op_name}" for op in memory_op if op])}{color.ENDC}')
 
 		#检查  buffer 是否空闲，buffer是否有空间，是否满足计算依赖
 		# Run memory operation
@@ -468,44 +470,24 @@ def simulate(model_dict: dict, config: dict, constants: dict, design_space: dict
 		#计算操作 计算资源的检测/分配/数据依赖检测
 		# Run compute operation
 		ops_to_set_required = []
-		if compute_op:
-			# We do not sort operations here for staggered implemention and better utilization
-			compute_stall = [None] * len(compute_op)
-			for head_idx, head_ops in enumerate(compute_op):
-				if head_ops is None: continue
+		compute_stall = [False]
+		def buffer_ready(op):
+			for data_name in op.required_in_buffer:
+				if not accelerator.activation_buffer.data_in_buffer(data_name) and not accelerator.weight_buffer.data_in_buffer(data_name) and not accelerator.mask_buffer.data_in_buffer(data_name):
+					return False
+			return True
 
-				# Check if required data is in memory
-				if type(head_ops) != list:
-					head_ops = [head_ops]
-
-				if not accelerator.can_assign(head_ops):
-					compute_stall[head_idx] = True
-					if debug: 
-						tqdm.write(f'{color.WARNING}Compute stall{f" for head {head_idx + 1}" if len(compute_op) > 1 else ""}: all resources are busy{color.ENDC}')
-						new_stalls[5] = max(1, new_stalls[5] + 1)
-
-				required_in_buffer_stall = False
-				for head_op in head_ops:
-					for data_name in head_op.required_in_buffer:
-						if not accelerator.activation_buffer.data_in_buffer(data_name) and not accelerator.weight_buffer.data_in_buffer(data_name):
-							compute_stall[head_idx] = True
-							required_in_buffer_stall = True
-							new_stalls[6] = max(1, new_stalls[6] + 1)
-							break
-				
-				if debug and required_in_buffer_stall: tqdm.write(f'{color.WARNING}Compute stall{f" for head {head_idx + 1}" if len(compute_op) > 1 else ""}: {data_name} required in buffer{color.ENDC}')
-							
-				#
-				if not compute_stall[head_idx]:
-					for head_op in head_ops:
-						assigned_op = accelerator.assign_op(head_op)
-						assert assigned_op is True
-						ops_to_set_required.append(head_op)
+		assigned_ops = scheduler.step(accelerator, buffer_check=buffer_ready)
+		if not assigned_ops:
+			compute_stall = [True]
+		for op in assigned_ops:
+			ops_to_set_required.append(op)
 
 		#硬件状态的推进					
 		# Process cycle for every module
-		total_pe_energy, activation_buffer_energy, weight_buffer_energy, mask_buffer_energy = accelerator.process_cycle(memory_ops, compute_ops, ops_to_set_required + compute_op)
+		total_pe_energy, activation_buffer_energy, weight_buffer_energy, mask_buffer_energy = accelerator.process_cycle(memory_ops, compute_ops, ops_to_set_required)
 		accelerator.cycle += 1
+		scheduler.update_done()
 
 		# Update stalls
 		stalls = [stalls[i] + new_stalls[i] for i in range(7)]
@@ -550,9 +532,7 @@ def simulate(model_dict: dict, config: dict, constants: dict, design_space: dict
 
 		#更新op指针，进入下一个周期
 		memory_op_idx, ops_done = update_op_idx(memory_ops, memory_op_idx, memory_stall, memory_ops_batch_size, ops_done)
-		compute_op_idx, ops_done = update_op_idx(compute_ops, compute_op_idx, compute_stall, compute_ops_batch_size, ops_done)
-
-		memory_op, compute_op = get_op_list(memory_ops, memory_op_idx, memory_ops_batch_size), get_op_list(compute_ops, compute_op_idx, compute_ops_batch_size)
+		memory_op = get_op_list(memory_ops, memory_op_idx, memory_ops_batch_size)
 
 	# Save remaining logs
 	if DO_LOGGING: 
@@ -762,4 +742,3 @@ def simulate_fast(model_dict: dict, config: dict, constants: dict, design_space:
 	print(f'{color.GREEN}Finished simulation{color.ENDC}')
 
 	return logs
-

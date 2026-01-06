@@ -32,6 +32,26 @@ class Accelerator(object):
 		for p in range(config['pe']):
 			self.pes.append(ProcessingElement(f'pe{p}', config, constants, mode))
 
+		self.pe_group_size = config.get('pe_group_size', 4)
+		self.groups = [list(range(i, min(i + self.pe_group_size, len(self.pes)))) for i in range(0, len(self.pes), self.pe_group_size)]
+		self.softmax_units = []
+		self.layer_norm_units = []
+		self.mask_prediction_units = []
+
+		total_softmax = config['pe'] * config['softmax_per_pe']
+		softmax_per_group = max(1, math.ceil(total_softmax / max(1, len(self.groups))))
+		for group_idx in range(len(self.groups)):
+			group_softmax = []
+			for s in range(softmax_per_group):
+				group_softmax.append(Softmax(f'group{group_idx}_sftm{(s + 1)}', config, constants))
+			self.softmax_units.append(group_softmax)
+
+		for ln_idx in range(config['pe']):
+			self.layer_norm_units.append(LayerNorm(f'ln{ln_idx}', config, constants))
+
+		for idx in range(config.get('mask_prediction_units', 1)):
+			self.mask_prediction_units.append(MaskPrediction(f'maskpred{idx}', config, constants))
+
 		self.activation_buffer = Buffer('activation', config, constants)
 		self.weight_buffer = Buffer('weight', config, constants)
 		self.mask_buffer = Buffer('mask', config, constants)
@@ -39,10 +59,19 @@ class Accelerator(object):
 		self.area = 0
 		for pe in self.pes:
 			self.area += pe.area
+		for group_softmax in self.softmax_units:
+			for sftm in group_softmax:
+				self.area += sftm.area
+		for ln in self.layer_norm_units:
+			self.area += ln.area
+		for maskpred in self.mask_prediction_units:
+			self.area += maskpred.area
 		self.area = self.area + self.activation_buffer.area + self.weight_buffer.area + self.mask_buffer.area
 
 		self.cycle = 0
 		self.idx_done = 0
+		self.fifo_capacity = config.get('fifo_capacity', 0)
+		self.fifo_occupancy = 0
 
 		# TODO: add main memory object with its leakage energy
 
@@ -69,9 +98,13 @@ class Accelerator(object):
 		for pe in self.pes:
 			for mac_lane in pe.mac_lanes:
 				if not mac_lane.ready: return False
-			for sftm in pe.softmax:
+		for group_softmax in self.softmax_units:
+			for sftm in group_softmax:
 				if not sftm.ready: return False
-			if not pe.layer_norm.ready: return False
+		for ln in self.layer_norm_units:
+			if not ln.ready: return False
+		for maskpred in self.mask_prediction_units:
+			if not maskpred.ready: return False
 			
 		return True
 
@@ -83,20 +116,35 @@ class Accelerator(object):
 				if mac_lane.ready: num_free += 1
 		return num_free, num_mac_lanes
 
+	def group_mac_lanes_free(self, group_id):
+		num_free = 0
+		for pe_idx in self.groups[group_id % len(self.groups)]:
+			for mac_lane in self.pes[pe_idx].mac_lanes:
+				if mac_lane.ready:
+					num_free += 1
+		return num_free
+
 	def num_ln_free(self):
 		num_ln, num_free = 0, 0
-		for pe in self.pes:
+		for ln in self.layer_norm_units:
 			num_ln += 1
-			if pe.layer_norm.ready: num_free += 1
+			if ln.ready: num_free += 1
 		return num_free, num_ln
 
 	def num_sftm_free(self):
 		num_sftm, num_free = 0, 0
-		for pe in self.pes:
-			for sftm in pe.softmax:
+		for group_softmax in self.softmax_units:
+			for sftm in group_softmax:
 				num_sftm += 1
 				if sftm.ready: num_free += 1
 		return num_free, num_sftm
+
+	def num_mask_pred_free(self):
+		num_mask, num_free = 0, 0
+		for maskpred in self.mask_prediction_units:
+			num_mask += 1
+			if maskpred.ready: num_free += 1
+		return num_free, num_mask
 
 	def _fill_buffer(self, buffer_arr, num_ones):
 		count = 0
@@ -198,10 +246,12 @@ class Accelerator(object):
 				ax.grid(color='k', linewidth=0.5)
 				fig.add_subplot(ax)
 
-				sftm_arr = np.zeros((1, len(self.pes[pe_count].softmax)))
+				group_idx = pe_count // self.pe_group_size
+				group_softmax = self.softmax_units[group_idx % len(self.softmax_units)] if self.softmax_units else []
+				sftm_arr = np.zeros((1, len(group_softmax)))
 				sftm_count = 0
 				for i in range(sftm_arr.shape[1]):
-					sftm_arr[0, i] = 1 if not self.pes[pe_count].softmax[sftm_count].ready else 0
+					sftm_arr[0, i] = 1 if not group_softmax[sftm_count].ready else 0
 					sftm_count += 1
 
 				ax = plt.Subplot(fig, sftm_spec)
@@ -216,7 +266,7 @@ class Accelerator(object):
 				fig.add_subplot(ax)
 				
 				ln_arr = np.zeros((1, 1))
-				ln_arr[0][0] = 1 if not self.pes[pe_count].layer_norm.ready else 0
+				ln_arr[0][0] = 1 if not self.layer_norm_units[pe_count].ready else 0
 
 				ax = plt.Subplot(fig, ln_spec)
 				ax.imshow(ln_arr, interpolation='none', aspect='auto', 
@@ -244,6 +294,19 @@ class Accelerator(object):
 			pe_energy = pe.process_cycle()
 			total_pe_energy[0] += pe_energy[0]; total_pe_energy[1] += pe_energy[1]
 
+		for group_softmax in self.softmax_units:
+			for sftm in group_softmax:
+				sftm_energy = sftm.process_cycle()
+				total_pe_energy[0] += sftm_energy[0]; total_pe_energy[1] += sftm_energy[1]
+
+		for ln in self.layer_norm_units:
+			ln_energy = ln.process_cycle()
+			total_pe_energy[0] += ln_energy[0]; total_pe_energy[1] += ln_energy[1]
+
+		for maskpred in self.mask_prediction_units:
+			mask_energy = maskpred.process_cycle()
+			total_pe_energy[0] += mask_energy[0]; total_pe_energy[1] += mask_energy[1]
+
 		activation_buffer_energy = self.activation_buffer.process_cycle()
 		weight_buffer_energy = self.weight_buffer.process_cycle()
 		mask_buffer_energy = self.mask_buffer.process_cycle()
@@ -255,12 +318,18 @@ class Accelerator(object):
 			if type(compute_op) == list:
 				for head_ops in compute_op:
 					for head_idx, head_op in enumerate(head_ops):
-						if head_op.done == True: 
+						if head_op.done == True:
+							if head_op.fifo_consumer and not head_op.fifo_released and self.fifo_capacity:
+								self.fifo_occupancy = max(0, self.fifo_occupancy - 1)
+								head_op.fifo_released = True
 							self.set_not_required(head_op)
 						else:
 							break
 			else:
 				if compute_op.done == True:
+					if compute_op.fifo_consumer and not compute_op.fifo_released and self.fifo_capacity:
+						self.fifo_occupancy = max(0, self.fifo_occupancy - 1)
+						compute_op.fifo_released = True
 					self.set_not_required(compute_op)
 					self.idx_done = idx
 				else:
@@ -282,19 +351,31 @@ class Accelerator(object):
 		num_mac_lanes_free, num_mac_lanes = self.num_mac_lanes_free()
 		num_ln_free, num_ln = self.num_ln_free()
 		num_sftm_free, num_sftm = self.num_sftm_free()
+		num_mask_free, num_mask = self.num_mask_pred_free()
 
 		num_mac_lanes_to_assign, num_ln_to_assign, num_sftm_to_assign = 0, 0, 0
+		num_mask_to_assign = 0
 
 		for op in op_list:
 			assert op.compute_op is True
 			if isinstance(op, (MatrixMultOp, MatrixMultTiledOp, Conv1DOp, Conv1DTiledOp, NonLinearityOp, NonLinearityTiledOp)):
+				if self.fifo_capacity and op.fifo_producer and self.fifo_occupancy >= self.fifo_capacity:
+					return False
+				if op.group_id is not None and self.group_mac_lanes_free(op.group_id) == 0:
+					return False
 				num_mac_lanes_to_assign += 1
 			elif isinstance(op, (LayerNormOp, LayerNormTiledOp)):
 				num_ln_to_assign += 1
 			elif isinstance(op, (SoftmaxOp, SoftmaxTiledOp)):
+				if op.group_id is not None:
+					group_softmax = self.softmax_units[op.group_id % len(self.softmax_units)]
+					if not any(unit.ready for unit in group_softmax):
+						return False
 				num_sftm_to_assign += 1
+			elif isinstance(op, MaskPredictionOp):
+				num_mask_to_assign += 1
 
-		if num_mac_lanes_free < num_mac_lanes_to_assign or num_ln_free < num_ln_to_assign or num_sftm_free < num_sftm_to_assign:
+		if num_mac_lanes_free < num_mac_lanes_to_assign or num_ln_free < num_ln_to_assign or num_sftm_free < num_sftm_to_assign or num_mask_free < num_mask_to_assign:
 			return False
 
 		return True
@@ -304,9 +385,36 @@ class Accelerator(object):
 		assert op.compute_op is True
 		assigned_op = False
 
-		for pe in self.pes:
-			assigned_op = pe.assign_op(op)
-			if assigned_op == True: break
+		if isinstance(op, (SoftmaxOp, SoftmaxTiledOp)):
+			group_id = op.group_id if op.group_id is not None else 0
+			for sftm in self.softmax_units[group_id % len(self.softmax_units)]:
+				if sftm.ready:
+					sftm.assign_op(op)
+					assigned_op = True
+					break
+		elif isinstance(op, (LayerNormOp, LayerNormTiledOp)):
+			for ln in self.layer_norm_units:
+				if ln.ready:
+					ln.assign_op(op)
+					assigned_op = True
+					break
+		elif isinstance(op, MaskPredictionOp):
+			for maskpred in self.mask_prediction_units:
+				if maskpred.ready:
+					maskpred.assign_op(op)
+					assigned_op = True
+					break
+		else:
+			if op.group_id is not None:
+				for pe_idx in self.groups[op.group_id % len(self.groups)]:
+					assigned_op = self.pes[pe_idx].assign_op(op)
+					if assigned_op: break
+			else:
+				for pe in self.pes:
+					assigned_op = pe.assign_op(op)
+					if assigned_op: break
+
+		if assigned_op and op.fifo_producer and self.fifo_capacity:
+			self.fifo_occupancy += 1
 
 		return assigned_op
-

@@ -103,6 +103,18 @@ class Softmax(Module):
 		self.assigned_op = op
 
 
+class MaskPrediction(Module):
+	def __init__(self, module_name, config, constants):
+		Module.__init__(self, module_name, constants['mask_prediction']['dynamic'], constants['mask_prediction']['leakage'], constants['mask_prediction']['area'], constants['clock_frequency'])
+		self.assigned_op = None
+
+	def assign_op(self, op):
+		self.process_cycles = max(1, getattr(op, 'latency', 1))
+		self.ready = False
+
+		self.assigned_op = op
+
+
 class FIFO(Module):
 	def __init__(self, module_name, config, constants):
 		Module.__init__(self, module_name, constants['fifo']['dynamic'], constants['fifo']['leakage'], constants['fifo']['area'], constants['clock_frequency'])
@@ -231,4 +243,3 @@ class MACLane(Module):
 
 		if self.mode == 'training':
 			self.stochastic_rounding.assign_op(op)
-
