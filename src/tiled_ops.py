@@ -8,6 +8,11 @@ class TiledOp(object):
 	def __init__(self, op_name):
 		self.op_name = op_name
 		self.done = False
+		self.dependencies = []
+		self.fifo_producer = False
+		self.fifo_consumer = False
+		self.fifo_released = False
+		self.group_id = None
 
 
 class TiledData(object):

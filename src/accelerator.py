@@ -257,7 +257,7 @@ class Accelerator(object):
 				ax = plt.Subplot(fig, sftm_spec)
 				ax.imshow(sftm_arr, interpolation='none', aspect='auto', 
 						  rasterized=True, cmap='Greens', vmin=0, vmax=1.5)
-				ax.set_xticks(np.arange(-0.5, len(self.pes[pe_count].softmax), 1))
+				ax.set_xticks(np.arange(-0.5, len(group_softmax), 1))
 				ax.set_yticks(np.arange(-0.5, 1, 1))
 				ax.set_xticklabels([])
 				ax.set_yticklabels([])
