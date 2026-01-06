@@ -82,6 +82,11 @@ softmax:
     dynamic: 131.2602298481
     leakage: 10.4423
 
+mask_prediction:
+  area: 1000.0
+  dynamic: 0.1
+  leakage: 0.01
+
 pre_sparsity:
   area: 6216.896914
   dynamic: 0.2852968

@@ -6,11 +6,21 @@ from tiled_ops import *
 
 class Op(object):
 	"""Class for a generic Transformer operation"""
+	_op_counter = 0
+
 	def __init__(self, op_name, config):
 		self.op_name = op_name
 		self.config = config
 		self.base_op = False
 		self.done = False
+		self.dependencies = []
+		self.group_id = None
+		self.fifo_producer = False
+		self.fifo_consumer = False
+		self.fifo_released = False
+
+		Op._op_counter += 1
+		self.uid = Op._op_counter
 
 		# List of data names required in buffer for the current operation
 		self.required_in_buffer = [] 
@@ -93,6 +103,23 @@ class MemoryStoreOp(Op):
 		return self.tiled_ops
 
 
+class MaskPredictionOp(Op):
+	"""Mask prediction operation (fast simulated)"""
+	def __init__(self, op_name, config, mask_size, latency=1):
+		Op.__init__(self, op_name, config)
+		self.mask_size = mask_size
+		self.latency = latency
+		self.compute_op = True
+		self.base_op = True
+
+	def output_size(self):
+		return self.mask_size
+
+	def tile_op(self):
+		self.tiled_ops = [self]
+		return self.tiled_ops
+
+
 class MatrixMultOp(Op):
 	"""Matrix multiplication base operation
 
@@ -164,6 +191,65 @@ class MatrixMultOp(Op):
 				for l2 in range(num_tiles[2]):
 					for l3 in range(num_tiles[3]):
 						b, i, j, k = eval(f'l{loop_order.index("b")}'), eval(f'l{loop_order.index("i")}'), eval(f'l{loop_order.index("j")}'), eval(f'l{loop_order.index("k")}')
+						op_name = f'{self.op_name}_b{b}_i{i}_j{j}_k{k}'
+						self.tiled_ops.append(MatrixMultTiledOp(op_name, self.required_in_buffer, tile_size, tile_size, mode=self.mode))
+
+		return self.tiled_ops
+
+
+class ClusterMatrixMultOp(MatrixMultOp):
+	"""Clustered matrix multiplication base operation"""
+	def __init__(self, op_name, config, required_in_buffer, input_1_size, input_2_size, mask, cluster_range, region_type, mode='fwd'):
+		super().__init__(op_name, config, required_in_buffer, input_1_size, input_2_size, mode=mode)
+		self.mask = mask
+		self.cluster_range = cluster_range
+		self.region_type = region_type
+
+	def _tile_is_active(self, row_start, row_end, col_start, col_end):
+		cluster_start, cluster_end = self.cluster_range
+		in_dense = row_start >= cluster_start and row_end <= cluster_end and col_start >= cluster_start and col_end <= cluster_end
+		if self.region_type == 'dense':
+			return in_dense
+		if in_dense:
+			return False
+
+		for r in range(row_start, min(row_end, len(self.mask))):
+			for c in range(col_start, min(col_end, len(self.mask[r]))):
+				if self.mask[r][c]:
+					return True
+		return False
+
+	def tile_op(self):
+		num_tiles_b = math.ceil(self.input_1_size[0] * 1.0 / self.config['tile']['tile_b'])
+		num_tiles_1_x = math.ceil(self.input_1_size[1] * 1.0 / self.config['tile']['tile_x'])
+		num_tiles_1_y = math.ceil(self.input_1_size[2] * 1.0 / self.config['tile']['tile_y'])
+		num_tiles_2_x = math.ceil(self.input_2_size[1] * 1.0 / self.config['tile']['tile_x'])
+		num_tiles_2_y = math.ceil(self.input_2_size[2] * 1.0 / self.config['tile']['tile_y'])
+
+		assert num_tiles_1_y == num_tiles_2_x
+
+		tile_size = (self.config['tile']['tile_b'], self.config['tile']['tile_x'], self.config['tile']['tile_y'])
+
+		loop_order = self.loop_unrolling.split('_')
+		num_tiles = []
+		for order in loop_order:
+			if order == 'b': num_tiles.append(num_tiles_b)
+			if order == 'i': num_tiles.append(num_tiles_1_x)
+			if order == 'j': num_tiles.append(num_tiles_2_y)
+			if order == 'k': num_tiles.append(num_tiles_2_x)
+
+		self.tiled_ops = []
+		for l0 in range(num_tiles[0]):
+			for l1 in range(num_tiles[1]):
+				for l2 in range(num_tiles[2]):
+					for l3 in range(num_tiles[3]):
+						b, i, j, k = eval(f'l{loop_order.index("b")}'), eval(f'l{loop_order.index("i")}'), eval(f'l{loop_order.index("j")}'), eval(f'l{loop_order.index("k")}')
+						row_start = i * tile_size[1]
+						row_end = row_start + tile_size[1]
+						col_start = j * tile_size[2]
+						col_end = col_start + tile_size[2]
+						if not self._tile_is_active(row_start, row_end, col_start, col_end):
+							continue
 						op_name = f'{self.op_name}_b{b}_i{i}_j{j}_k{k}'
 						self.tiled_ops.append(MatrixMultTiledOp(op_name, self.required_in_buffer, tile_size, tile_size, mode=self.mode))
 
@@ -304,6 +390,44 @@ class SoftmaxOp(Op):
 		return self.tiled_ops
 
 
+class ClusterSoftmaxOp(SoftmaxOp):
+	"""Clustered softmax operation"""
+	def __init__(self, op_name, config, required_in_buffer, input_size, mask, cluster_range, region_type):
+		super().__init__(op_name, config, required_in_buffer, input_size)
+		self.mask = mask
+		self.cluster_range = cluster_range
+		self.region_type = region_type
+
+	def _tile_is_active(self, row_start, row_end, col_start, col_end):
+		cluster_start, cluster_end = self.cluster_range
+		in_dense = row_start >= cluster_start and row_end <= cluster_end and col_start >= cluster_start and col_end <= cluster_end
+		if self.region_type == 'dense':
+			return in_dense
+		if in_dense:
+			return False
+		for r in range(row_start, min(row_end, len(self.mask))):
+			for c in range(col_start, min(col_end, len(self.mask[r]))):
+				if self.mask[r][c]:
+					return True
+		return False
+
+	def tile_op(self):
+		self.tiled_ops = []
+		tile_x = self.config['tile']['tile_x']
+		tile_y = self.config['tile']['tile_y']
+		for b in range(math.ceil(self.input_size[0] * 1.0 / self.config['tile']['tile_b'])):
+			for x in range(math.ceil(self.input_size[1] * 1.0 / tile_x)):
+				for y in range(math.ceil(self.input_size[2] * 1.0 / tile_y)):
+					row_start = x * tile_x
+					row_end = row_start + tile_x
+					col_start = y * tile_y
+					col_end = col_start + tile_y
+					if not self._tile_is_active(row_start, row_end, col_start, col_end):
+						continue
+					self.tiled_ops.append(SoftmaxTiledOp(f'{self.op_name}_b{b}_x{x}_y{y}', self.required_in_buffer, (tile_x, tile_y)))
+		return self.tiled_ops
+
+
 class SelfAttentionOp(Op):
 	"""Self-attention operation
 	
@@ -323,9 +447,24 @@ class SelfAttentionOp(Op):
 	def convert_to_fwd_base_ops(self):
 		"""Convert operation to forward base operations"""
 		self.fwd_base_ops = []
+		cluster_config = self.config.get('cluster', {})
+		cluster_enabled = cluster_config.get('enabled', False)
 
 		# Input activations are assumed to be in the activation buffer for throughput calculation (i.e., only loaded once)
 		## self.fwd_base_ops.append(MemoryLoadOp(f'{self.op_name}_inp-l', self.config, self.input_size, 'activation'))
+
+		mask_store_op = None
+		mask_pred_op = None
+		if cluster_enabled:
+			seq_len = self.input_size[1]
+			cluster_count = cluster_config.get('count', 1)
+			mask_prediction_cycles = cluster_config.get('mask_prediction_cycles', 1)
+
+			mask_pred_op = MaskPredictionOp(f'{self.op_name}_mask-pred', self.config, (1, seq_len, seq_len), latency=mask_prediction_cycles)
+			self.fwd_base_ops.append(mask_pred_op)
+			mask_store_op = MemoryStoreOp(f'{self.op_name}_mask-s', self.config, (1, seq_len, seq_len), 'mask')
+			mask_store_op.dependencies = [mask_pred_op]
+			self.fwd_base_ops.append(mask_store_op)
 
 		# Load weight matrices
 		self.weight_size = (self.input_size[0], self.input_size[2], self.hidden_size)
@@ -345,9 +484,10 @@ class SelfAttentionOp(Op):
 		self.key_transposed_size = Op.transpose_size(self.key_size)
 
 		# Store key, query and value matrices in buffer
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_q-s', self.config, self.query_size, 'activation'))
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_k-s', self.config, self.key_size, 'activation'))
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_v-s', self.config, self.value_size, 'activation'))
+		query_store_op = MemoryStoreOp(f'{self.op_name}_q-s', self.config, self.query_size, 'activation')
+		key_store_op = MemoryStoreOp(f'{self.op_name}_k-s', self.config, self.key_size, 'activation')
+		value_store_op = MemoryStoreOp(f'{self.op_name}_v-s', self.config, self.value_size, 'activation')
+		self.fwd_base_ops.extend([query_store_op, key_store_op, value_store_op])
 
 		# Implement weighted multiplicative attention
 		if self.type == 'wma':
@@ -366,42 +506,147 @@ class SelfAttentionOp(Op):
 		else:
 			self.mult_key_size = self.key_transposed_size
 
-		# Implement scaled dot-product
-		sdp_1_op = MatrixMultOp(f'{self.op_name}_sdp-qk', self.config, [f'{self.op_name}_q-s', f'{self.op_name}_k-s', f'{self.op_name}_v-s'], self.query_size, self.mult_key_size)
-		self.fwd_base_ops.append(sdp_1_op)
+		if cluster_enabled:
+			self.out_weight_size = (self.input_size[0], self.hidden_size, self.input_size[2])
+			out_weight_op = MemoryLoadOp(f'{self.op_name}_o-l', self.config, self.out_weight_size, 'weight')
+			self.fwd_base_ops.append(out_weight_op)
+			cluster_masks = self._build_cluster_masks(seq_len, cluster_count, cluster_config.get('sparse_density', 0.05))
 
-		self.sdp_1_size = sdp_1_op.output_size()
+			for cluster_id, cluster_data in enumerate(cluster_masks):
+				mask, cluster_range = cluster_data['mask'], cluster_data['range']
+				for region_type in ['dense', 'sparse']:
+					qk_op = ClusterMatrixMultOp(
+						f'{self.op_name}_sdp-qk_c{cluster_id}_{region_type}',
+						self.config,
+						[f'{self.op_name}_q-s', f'{self.op_name}_k-s', f'{self.op_name}_v-s', f'{self.op_name}_mask-s'],
+						self.query_size,
+						self.mult_key_size,
+						mask,
+						cluster_range,
+						region_type,
+					)
+					qk_op.dependencies = [query_op, key_op, value_op]
+					if mask_pred_op is not None:
+						qk_op.dependencies.append(mask_pred_op)
+					qk_op.fifo_producer = True
+					self.fwd_base_ops.append(qk_op)
+					self.sdp_1_size = qk_op.output_size()
+					qk_store_op = MemoryStoreOp(f'{qk_op.op_name}-s', self.config, self.sdp_1_size, 'activation')
+					qk_store_op.dependencies = [qk_op]
+					self.fwd_base_ops.append(qk_store_op)
 
-		# Store scaled dot-product output
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_sdp-qk-s', self.config, self.sdp_1_size, 'activation'))
+					sftm_op = ClusterSoftmaxOp(
+						f'{self.op_name}_sftm_c{cluster_id}_{region_type}',
+						self.config,
+						[f'{qk_op.op_name}-s', f'{self.op_name}_v-s'],
+						self.sdp_1_size,
+						mask,
+						cluster_range,
+						region_type,
+					)
+					sftm_op.dependencies = [qk_op, value_op]
+					sftm_op.fifo_consumer = True
+					sftm_op.fifo_producer = True
+					self.fwd_base_ops.append(sftm_op)
+					sftm_store_op = MemoryStoreOp(f'{sftm_op.op_name}-s', self.config, self.sdp_1_size, 'activation')
+					sftm_store_op.dependencies = [sftm_op]
+					self.fwd_base_ops.append(sftm_store_op)
 
-		# Implement softmax function
-		self.fwd_base_ops.append(SoftmaxOp(f'{self.op_name}_sftm', self.config, [f'{self.op_name}_sdp-qk-s', f'{self.op_name}_v-s'], self.sdp_1_size))
+					sdp_2_op = ClusterMatrixMultOp(
+						f'{self.op_name}_sdp-v_c{cluster_id}_{region_type}',
+						self.config,
+						[f'{self.op_name}_v-s', f'{sftm_op.op_name}-s'],
+						self.sdp_1_size,
+						self.value_size,
+						mask,
+						cluster_range,
+						region_type,
+					)
+					sdp_2_op.dependencies = [sftm_op, value_op]
+					sdp_2_op.fifo_consumer = True
+					self.fwd_base_ops.append(sdp_2_op)
+					self.sdp_2_size = sdp_2_op.output_size()
+					sdp_2_store_op = MemoryStoreOp(f'{sdp_2_op.op_name}-s', self.config, self.sdp_2_size, 'activation', overwrite=True)
+					sdp_2_store_op.dependencies = [sdp_2_op]
+					self.fwd_base_ops.append(sdp_2_store_op)
 
-		# Store sotfmax output
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_sftm-s', self.config, self.sdp_1_size, 'activation'))
+					out_op = MatrixMultOp(
+						f'{self.op_name}_o_c{cluster_id}_{region_type}',
+						self.config,
+						[f'{self.op_name}_o-l', f'{sdp_2_op.op_name}-s'],
+						self.sdp_2_size,
+						self.out_weight_size,
+					)
+					out_op.dependencies = [sdp_2_op]
+					self.fwd_base_ops.append(out_op)
+					self.output_size = out_op.output_size()
+					assert self.output_size == self.input_size
+					out_store_op = MemoryStoreOp(f'{self.op_name}_o-s', self.config, self.input_size, 'activation', overwrite=True)
+					out_store_op.dependencies = [out_op]
+					self.fwd_base_ops.append(out_store_op)
+		else:
+			# Implement scaled dot-product
+			sdp_1_op = MatrixMultOp(f'{self.op_name}_sdp-qk', self.config, [f'{self.op_name}_q-s', f'{self.op_name}_k-s', f'{self.op_name}_v-s'], self.query_size, self.mult_key_size)
+			self.fwd_base_ops.append(sdp_1_op)
 
-		# Multiply with value matrix
-		sdp_2_op = MatrixMultOp(f'{self.op_name}_sdp-v', self.config, [f'{self.op_name}_v-s', f'{self.op_name}_sftm-s'],  self.sdp_1_size, self.value_size)
-		self.fwd_base_ops.append(sdp_2_op)
+			self.sdp_1_size = sdp_1_op.output_size()
 
-		self.sdp_2_size = sdp_2_op.output_size()
+			# Store scaled dot-product output
+			self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_sdp-qk-s', self.config, self.sdp_1_size, 'activation'))
 
-		# Store value matrix multiplication output
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_sdp-v-s', self.config, self.sdp_2_size, 'activation'))
+			# Implement softmax function
+			self.fwd_base_ops.append(SoftmaxOp(f'{self.op_name}_sftm', self.config, [f'{self.op_name}_sdp-qk-s', f'{self.op_name}_v-s'], self.sdp_1_size))
 
-		# Multiply with output matrix
-		self.out_weight_size = (self.input_size[0], self.hidden_size, self.input_size[2])
-		self.fwd_base_ops.append(MemoryLoadOp(f'{self.op_name}_o-l', self.config, self.out_weight_size, 'weight'))
+			# Store sotfmax output
+			self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_sftm-s', self.config, self.sdp_1_size, 'activation'))
 
-		out_op = MatrixMultOp(f'{self.op_name}_o', self.config, [f'{self.op_name}_o-l', f'{self.op_name}_sdp-v-s'], self.sdp_2_size, self.out_weight_size)
-		self.fwd_base_ops.append(out_op)
+			# Multiply with value matrix
+			sdp_2_op = MatrixMultOp(f'{self.op_name}_sdp-v', self.config, [f'{self.op_name}_v-s', f'{self.op_name}_sftm-s'],  self.sdp_1_size, self.value_size)
+			self.fwd_base_ops.append(sdp_2_op)
 
-		self.output_size = out_op.output_size()
-		assert self.output_size == self.input_size
+			self.sdp_2_size = sdp_2_op.output_size()
 
-		# Store attenion-head output matrix
-		self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_o-s', self.config, self.input_size, 'activation'))
+			# Store value matrix multiplication output
+			self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_sdp-v-s', self.config, self.sdp_2_size, 'activation'))
+
+			# Multiply with output matrix
+			self.out_weight_size = (self.input_size[0], self.hidden_size, self.input_size[2])
+			self.fwd_base_ops.append(MemoryLoadOp(f'{self.op_name}_o-l', self.config, self.out_weight_size, 'weight'))
+
+			out_op = MatrixMultOp(f'{self.op_name}_o', self.config, [f'{self.op_name}_o-l', f'{self.op_name}_sdp-v-s'], self.sdp_2_size, self.out_weight_size)
+			self.fwd_base_ops.append(out_op)
+
+			self.output_size = out_op.output_size()
+			assert self.output_size == self.input_size
+
+			# Store attenion-head output matrix
+			self.fwd_base_ops.append(MemoryStoreOp(f'{self.op_name}_o-s', self.config, self.input_size, 'activation'))
+
+	def _build_cluster_masks(self, seq_len, cluster_count, sparse_density):
+		cluster_ranges = []
+		base = seq_len // cluster_count
+		remainder = seq_len % cluster_count
+		start = 0
+		for idx in range(cluster_count):
+			size = base + (1 if idx < remainder else 0)
+			end = start + size
+			cluster_ranges.append((start, end))
+			start = end
+
+		sparse_stride = max(1, int(1.0 / sparse_density))
+		cluster_masks = []
+		for cluster_start, cluster_end in cluster_ranges:
+			mask = [[False for _ in range(seq_len)] for _ in range(seq_len)]
+			for r in range(seq_len):
+				for c in range(seq_len):
+					in_dense = cluster_start <= r < cluster_end and cluster_start <= c < cluster_end
+					if in_dense:
+						mask[r][c] = True
+					else:
+						if (r + c) % sparse_stride == 0:
+							mask[r][c] = True
+			cluster_masks.append({'mask': mask, 'range': (cluster_start, cluster_end)})
+		return cluster_masks
 
 	def convert_to_bwd_base_ops(self):
 		"""Convert operation to backward base operations"""
@@ -753,4 +998,3 @@ class FeedForwardOp(Op):
 				self.tile_op.extend(op.tile_op())
 
 		return self.tiled_ops
-
